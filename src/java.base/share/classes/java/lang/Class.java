@@ -76,6 +76,7 @@ import jdk.internal.reflect.ConstantPool;
 import jdk.internal.reflect.Reflection;
 import jdk.internal.reflect.ReflectionFactory;
 import jdk.internal.vm.annotation.ForceInline;
+import jdk.internal.vm.annotation.Stable;
 import sun.invoke.util.Wrapper;
 import sun.reflect.generics.factory.CoreReflectionFactory;
 import sun.reflect.generics.factory.GenericsFactory;
@@ -4237,7 +4238,8 @@ public final class Class<T> implements java.io.Serializable,
     /* Backing store of user-defined values pertaining to this class.
      * Maintained by the ClassValue class.
      */
-    transient ClassValue.ClassValueMap classValueMap;
+    @Stable
+    transient ClassValue.McsEntry[] cvTable;
 
     /**
      * Returns an {@code AnnotatedType} object that represents the use of a
