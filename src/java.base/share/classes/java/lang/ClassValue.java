@@ -25,12 +25,14 @@
 
 package java.lang;
 
-import java.util.WeakHashMap;
+import jdk.internal.vm.annotation.Stable;
+
 import java.lang.ref.WeakReference;
+import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static java.lang.ClassValue.ClassValueMap.probeHomeLocation;
 import static java.lang.ClassValue.ClassValueMap.probeBackupLocations;
+import static java.lang.ClassValue.ClassValueMap.probeHomeLocation;
 
 /**
  * Lazily associate a computed value with (potentially) every type.
@@ -96,6 +98,9 @@ public abstract class ClassValue<T> {
      * @see #computeValue
      */
     public T get(Class<?> type) {
+        // try constant value 1st
+        T cval = getConstantValue(type);
+        if (cval != null) return cval;
         // non-racing this.hashCodeForCache : final int
         Entry<?>[] cache;
         Entry<T> e = probeHomeLocation(cache = getCacheCarefully(type), this);
@@ -112,6 +117,65 @@ public abstract class ClassValue<T> {
         // 3. an entry has been removed (either on this type or another)
         // 4. the GC has somehow managed to delete e.version and clear the reference
         return getFromBackup(cache, type);
+    }
+
+    /** return constant-foldable value for this CV and given type or null if index out of bounds */
+    private T getConstantValue(Class<?> type) {
+        int i = getIndexForCVTable();
+        if (i <= CV_TABLE_LEN) {
+            ValueHolder<?>[] cvt = getCVTable(type);
+            return getConstantValue(type, cvt, i);
+        } else {
+            // index out of bounds - fall-back to normal ClassValue lookup
+            return null;
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private T getConstantValue(Class<?> type, ValueHolder<?>[] cvt, int i) {
+        ValueHolder<T> vh = (ValueHolder) cvt[i - 1];
+        if (vh == null) {
+            T value = computeValue(type);
+            synchronized (cvt) {
+                vh = (ValueHolder) cvt[i - 1];
+                if (vh == null) {
+                    vh = new ValueHolder<>(value);
+                    cvt[i - 1] = vh;
+                }
+            }
+        }
+        return vh.value;
+    }
+
+    private ValueHolder<?>[] getCVTable(Class<?> type) {
+        ValueHolder<?>[] cvt = type.classValueTable;
+        if (cvt == null) {
+            synchronized (type) {
+                cvt = type.classValueTable;
+                if (cvt == null) {
+                    cvt = new ValueHolder<?>[CV_TABLE_LEN];
+                    type.classValueTable = cvt;
+                }
+            }
+        }
+        return cvt;
+    }
+
+    private int getIndexForCVTable() {
+        int i = indexForCVTable;
+        if (i == 0) {
+            synchronized (this) {
+                i = indexForCVTable;
+                if (i == 0) {
+                    int li = lastIndex.get();
+                    i = li > CV_TABLE_LEN
+                        ? li
+                        : lastIndex.incrementAndGet();
+                    indexForCVTable = i;
+                }
+            }
+        }
+        return i;
     }
 
     /**
@@ -168,12 +232,22 @@ public abstract class ClassValue<T> {
      * @throws NullPointerException if the argument is null
      */
     public void remove(Class<?> type) {
+        int i = getIndexForCVTable();
+        if (i <= CV_TABLE_LEN) {
+            throw new UnsupportedOperationException(
+                "Remove not supported for constant-foldable class value");
+        }
         ClassValueMap map = getMap(type);
         map.removeEntry(this);
     }
 
     // Possible functionality for JSR 292 MR 1
     /*public*/ void put(Class<?> type, T value) {
+        int i = getIndexForCVTable();
+        if (i <= CV_TABLE_LEN) {
+            throw new UnsupportedOperationException(
+                "Put not supported for constant-foldable class value");
+        }
         ClassValueMap map = getMap(type);
         map.changeEntry(this, value);
     }
@@ -244,6 +318,16 @@ public abstract class ClassValue<T> {
         // invariant:  If version matches, then e.value is readable (final set in Entry.<init>)
     }
 
+    /** Lazily computed constant-foldable index into @Stable Class.classValueTable */
+    @Stable
+    private int indexForCVTable;
+
+    /** Generator for indexes into @Stable Class.classValueTable */
+    private static final AtomicInteger lastIndex = new AtomicInteger();
+
+    /** The length for @Stable Class.classValueTable arrays */
+    private static final int CV_TABLE_LEN = 32;
+
     /** Internal hash code for accessing Class.classValueMap.cacheArray. */
     final int hashCodeForCache = nextHashCode.getAndAdd(HASH_INCREMENT) & HASH_MASK;
 
@@ -306,6 +390,12 @@ public abstract class ClassValue<T> {
         ClassValue<T> classValue() { return classValue; }
         Entry<T> promise() { return promise; }
         boolean isLive() { return classValue.version() == this; }
+    }
+
+    /** Constant-foldable holder for value with safe-publication semantics */
+    static final class ValueHolder<T> {
+        @Stable final T value;
+        ValueHolder(T value) { this.value = value; }
     }
 
     /** One binding of a value to a class via a ClassValue.

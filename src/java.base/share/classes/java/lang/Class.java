@@ -76,6 +76,7 @@ import jdk.internal.reflect.ConstantPool;
 import jdk.internal.reflect.Reflection;
 import jdk.internal.reflect.ReflectionFactory;
 import jdk.internal.vm.annotation.ForceInline;
+import jdk.internal.vm.annotation.Stable;
 import sun.invoke.util.Wrapper;
 import sun.reflect.generics.factory.CoreReflectionFactory;
 import sun.reflect.generics.factory.GenericsFactory;
@@ -4233,6 +4234,12 @@ public final class Class<T> implements java.io.Serializable,
     Map<Class<? extends Annotation>, Annotation> getDeclaredAnnotationMap() {
         return annotationData().declaredAnnotations;
     }
+
+
+    /* A table for some of the class values that can be constant-folded.
+     * Maintained by the ClassValue class.
+     */
+    @Stable ClassValue.ValueHolder<?>[] classValueTable;
 
     /* Backing store of user-defined values pertaining to this class.
      * Maintained by the ClassValue class.
