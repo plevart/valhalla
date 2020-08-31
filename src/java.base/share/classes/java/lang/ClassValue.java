@@ -137,7 +137,7 @@ public abstract class ClassValue<T> {
                 return valueId.value;
             }
         }
-        return getSlow(type, cvTable, entry);
+        return getSlow(type);
     }
 
     /**
@@ -194,16 +194,11 @@ public abstract class ClassValue<T> {
      * @throws NullPointerException if the argument is null
      */
     public void remove(Class<?> type) {
-        McsEntry[] cvTable = cvTable(type, index, false);
-        if (cvTable != null) {
-            McsEntry entry = cvTable[index - 1];
-            if (entry == null) {
-                synchronized (cvTable) {
-                    entry = cvTable[index - 1];
-                }
-            }
-            if (entry != null) {
-                synchronized (entry) {
+        synchronized (cvTableLock(type)) {
+            McsEntry[] cvTable = cvTable(type, index, false);
+            if (cvTable != null) {
+                McsEntry entry = cvTable[index - 1];
+                if (entry != null) {
                     ValueId<?> valueId = getValueId(entry);
                     if (valueId.cvId != 0) {
                         entry.setTarget(ValueId.NONE_MH);
@@ -215,9 +210,9 @@ public abstract class ClassValue<T> {
 
     // Possible functionality for JSR 292 MR 1
     /*public*/ void put(Class<?> type, T value) {
-        McsEntry[] cvTable = cvTable(type, index, true);
-        MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
-        synchronized (cvTable) {
+        synchronized (cvTableLock(type)) {
+            McsEntry[] cvTable = cvTable(type, index, true);
+            MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
             McsEntry entry = cvTable[index - 1];
             if (entry == null) {
                 cvTable[index - 1] = new McsEntry(mh);
@@ -231,21 +226,17 @@ public abstract class ClassValue<T> {
     /// Implementation...
     /// --------
 
-    @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
-    private T getSlow(Class<?> type, McsEntry[] cvTable, McsEntry entry) {
+    private T getSlow(Class<?> type) {
         T value = computeValue(type);
-        if (entry == null) {
-            synchronized (cvTable) {
-                entry = cvTable[index - 1];
-                if (entry == null) {
-                    MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
-                    entry = new McsEntry(mh);
-                    cvTable[index - 1] = entry;
-                    return value;
-                }
+        synchronized (cvTableLock(type)) {
+            McsEntry[] cvTable = cvTable(type, index, true);
+            McsEntry entry = cvTable[index - 1];
+            if (entry == null) {
+                MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
+                entry = new McsEntry(mh);
+                cvTable[index - 1] = entry;
+                return value;
             }
-        }
-        synchronized (entry) {
             ValueId<T> valueId = getValueId(entry);
             if (valueId.cvId == id) {
                 return valueId.value;
@@ -253,8 +244,8 @@ public abstract class ClassValue<T> {
             // entry != null but it is of a freed ClazzValue instance -> replace target
             MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
             entry.setTarget(mh);
+            return value;
         }
-        return value;
     }
 
     @SuppressWarnings("unchecked")
@@ -266,12 +257,10 @@ public abstract class ClassValue<T> {
         }
     }
 
-    private static final Object CV_TABLE_INIT_LOCK = new Object();
-
     private static McsEntry[] cvTable(Class<?> type, int index, boolean createIfAbsent) {
         McsEntry[] cvTable = type.cvTable;
         if ((cvTable == null || cvTable.length < index) && createIfAbsent) {
-            synchronized (CV_TABLE_INIT_LOCK) {
+            synchronized (cvTableLock(type)) {
                 cvTable = type.cvTable;
                 if (cvTable == null || cvTable.length < index) {
                     int newLen = Math.max(
@@ -285,7 +274,22 @@ public abstract class ClassValue<T> {
                 }
             }
         }
-        return cvTable.length < index ? null : cvTable;
+        return cvTable == null || cvTable.length < index ? null : cvTable;
+    }
+
+    private static final Object CV_TABLE_LOCK_INIT_LOCK = new Object();
+
+    private static Object cvTableLock(Class<?> type) {
+        Object cvTableLock = type.cvTableLock;
+        if (cvTableLock == null) {
+            synchronized (CV_TABLE_LOCK_INIT_LOCK) {
+                cvTableLock = type.cvTableLock;
+                if (cvTableLock == null) {
+                    type.cvTableLock = cvTableLock = new Object();
+                }
+            }
+        }
+        return cvTableLock;
     }
 
     /**

@@ -4241,6 +4241,10 @@ public final class Class<T> implements java.io.Serializable,
     @Stable
     transient ClassValue.McsEntry[] cvTable;
 
+    /* Per-class lock object used when accessing above cvTable in slow-path
+     */
+    transient Object cvTableLock;
+
     /**
      * Returns an {@code AnnotatedType} object that represents the use of a
      * type to specify the superclass of the entity represented by this {@code
