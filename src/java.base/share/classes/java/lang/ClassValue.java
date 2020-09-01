@@ -30,9 +30,8 @@ import jdk.internal.vm.annotation.Stable;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MutableCallSite;
-import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
-import java.util.Arrays;
+import java.lang.ref.WeakReference;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -48,38 +47,46 @@ import java.util.concurrent.atomic.AtomicLong;
 public abstract class ClassValue<T> {
     private static final int MIN_CVS = 1 << 4;
     private static final int MAX_CVS = 1 << 30;
+    private static final int HASH_INCREMENT = 0x61c88647; // like ThreadLocal
     private static final AtomicLong idGen = new AtomicLong();
-    private static final AtomicInteger indexGen = new AtomicInteger();
+    private static final AtomicInteger hashGen = new AtomicInteger();
+    private static final AtomicInteger liveCount = new AtomicInteger();
 
     @Stable
     private final long id = idGen.incrementAndGet();
     @Stable
-    private final int index;
+    private final int hash;
+
+    private final Ref ref;
 
     /**
      * Sole constructor.  (For invocation by subclass constructors, typically
      * implicit.)
      */
     protected ClassValue() {
-        int i = FreeIndex.poll();
-        if (i == 0) {
-            i = indexGen.incrementAndGet();
-            if (i > MAX_CVS || i < 0) {
-                indexGen.decrementAndGet();
+        int h = Ref.pollFreeHash();
+        if (h == 0) {
+            int count = liveCount.incrementAndGet();
+            if (count > MAX_CVS || count < 0) {
+                liveCount.decrementAndGet();
                 System.gc();
                 try {
                     Thread.sleep(10L);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 }
-                i = FreeIndex.poll();
-                if (i == 0) {
+                h = Ref.pollFreeHash();
+                if (h == 0) {
                     throw new OutOfMemoryError("Number of live ClazzValue instances exceeded " + MAX_CVS);
                 }
+            } else {
+                do {
+                    h = hashGen.addAndGet(HASH_INCREMENT);
+                } while (h == 0);
             }
         }
-        this.index = i;
-        new FreeIndex(this);
+        this.hash = h;
+        this.ref = new Ref(this);
     }
 
     /**
@@ -129,12 +136,14 @@ public abstract class ClassValue<T> {
      * @see #computeValue
      */
     public T get(Class<?> type) {
-        McsEntry[] cvTable = cvTable(type, index, true);
-        McsEntry entry = cvTable[index - 1];
-        if (entry != null) {
-            ValueId<T> valueId = getValueId(entry);
-            if (valueId.cvId == id) {
-                return valueId.value;
+        MutableCallSite[] cvTable = type.cvTable;
+        if (cvTable != null) {
+            MutableCallSite entry = cvTable[hash & (cvTable.length - 1)];
+            if (entry != null) {
+                ValueIdRef<T> valueId = getValueIdRef(entry);
+                if (valueId.cvId == id) {
+                    return valueId.value;
+                }
             }
         }
         return getSlow(type);
@@ -195,13 +204,13 @@ public abstract class ClassValue<T> {
      */
     public void remove(Class<?> type) {
         synchronized (cvTableLock(type)) {
-            McsEntry[] cvTable = cvTable(type, index, false);
+            MutableCallSite[] cvTable = cvTable(type, false);
             if (cvTable != null) {
-                McsEntry entry = cvTable[index - 1];
+                MutableCallSite entry = cvTable[hash & (cvTable.length - 1)];
                 if (entry != null) {
-                    ValueId<?> valueId = getValueId(entry);
+                    ValueIdRef<?> valueId = getValueIdRef(entry);
                     if (valueId.cvId != 0) {
-                        entry.setTarget(ValueId.NONE_MH);
+                        entry.setTarget(ValueIdRef.NONE_MH);
                     }
                 }
             }
@@ -211,11 +220,12 @@ public abstract class ClassValue<T> {
     // Possible functionality for JSR 292 MR 1
     /*public*/ void put(Class<?> type, T value) {
         synchronized (cvTableLock(type)) {
-            McsEntry[] cvTable = cvTable(type, index, true);
-            MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
-            McsEntry entry = cvTable[index - 1];
+            MutableCallSite[] cvTable = cvTable(type, true);
+            MethodHandle mh = MethodHandles.constant(ValueIdRef.class, new ValueIdRef<>(value, id, ref));
+            int i = hash & (cvTable.length - 1);
+            MutableCallSite entry = cvTable[i];
             if (entry == null) {
-                cvTable[index - 1] = new McsEntry(mh);
+                cvTable[i] = new MutableCallSite(mh);
             } else {
                 entry.setTarget(mh);
             }
@@ -229,52 +239,104 @@ public abstract class ClassValue<T> {
     private T getSlow(Class<?> type) {
         T value = computeValue(type);
         synchronized (cvTableLock(type)) {
-            McsEntry[] cvTable = cvTable(type, index, true);
-            McsEntry entry = cvTable[index - 1];
+            MutableCallSite[] cvTable = cvTable(type, true);
+            int i = hash & (cvTable.length - 1);
+            MutableCallSite entry = cvTable[i];
             if (entry == null) {
-                MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
-                entry = new McsEntry(mh);
-                cvTable[index - 1] = entry;
+                MethodHandle mh = MethodHandles.constant(ValueIdRef.class, new ValueIdRef<>(value, id, ref));
+                entry = new MutableCallSite(mh);
+                cvTable[i] = entry;
                 return value;
             }
-            ValueId<T> valueId = getValueId(entry);
-            if (valueId.cvId == id) {
-                return valueId.value;
+            ValueIdRef<T> valueIdRef = getValueIdRef(entry);
+            if (valueIdRef.cvId == id) {
+                return valueIdRef.value;
             }
             // entry != null but it is of a freed ClazzValue instance -> replace target
-            MethodHandle mh = MethodHandles.constant(ValueId.class, new ValueId<>(value, id));
+            MethodHandle mh = MethodHandles.constant(ValueIdRef.class, new ValueIdRef<>(value, id, ref));
             entry.setTarget(mh);
             return value;
         }
     }
 
     @SuppressWarnings("unchecked")
-    private static <T> ValueId<T> getValueId(McsEntry entry) {
+    private static <T> ValueIdRef<T> getValueIdRef(MutableCallSite entry) {
         try {
-            return (ValueId<T>) entry.dynamicInvoker.invokeExact();
+            return (ValueIdRef<T>) entry.getTarget().invokeExact();
         } catch (Throwable e) {
             throw new InternalError(e);
         }
     }
 
-    private static McsEntry[] cvTable(Class<?> type, int index, boolean createIfAbsent) {
-        McsEntry[] cvTable = type.cvTable;
-        if ((cvTable == null || cvTable.length < index) && createIfAbsent) {
-            synchronized (cvTableLock(type)) {
-                cvTable = type.cvTable;
-                if (cvTable == null || cvTable.length < index) {
-                    int newLen = Math.max(
-                        MIN_CVS,
-                        Integer.highestOneBit(index - 1) << 1
-                    );
-                    cvTable = cvTable == null
-                              ? new McsEntry[newLen]
-                              : Arrays.copyOf(cvTable, newLen);
-                    type.cvTable = cvTable;
+    /**
+     * Return a table that has a place to hold an entry for given type and this {@code ClassValue},
+     * creating (or resizing) it if {@code createIfAbsent} is {@code true} or return {@code null}.
+     * @implNote This method should be called while holding a lock on {@link #cvTableLock(Class)}
+     * with given {@code type} as an argument for that method.
+     *
+     * @param type the type the table is for
+     * @param createIfAbsent create (or resize) the table if necessary to accommodate a slot for this
+     *                       {@code ClassValue}
+     * @return a table or {@code null} (possible only when {@code createIfAbsent} is {@code false})
+     */
+    private MutableCallSite[] cvTable(Class<?> type, boolean createIfAbsent) {
+        // assert Thread.holdsLock(cvTableLock(type));
+        MutableCallSite[] cvTable = type.cvTable;
+        if (cvTable == null) {
+            if (createIfAbsent) {
+                type.cvTable = cvTable = new MutableCallSite[MIN_CVS];
+            }
+            return cvTable;
+        } else {
+            int len = cvTable.length;
+            while (true) {
+                MutableCallSite entry = cvTable[hash & (cvTable.length - 1)];
+                if (entry == null) {
+                    // slot free
+                    return cvTable;
                 }
+                ValueIdRef<T> valueIdRef = getValueIdRef(entry);
+                if (valueIdRef.cvId == id) {
+                    // ours
+                    return cvTable;
+                }
+                if (valueIdRef.cvRef.get() == null) {
+                    // slot was taken by GC-ed ClassValue, reuse it
+                    return cvTable;
+                }
+                if (!createIfAbsent) {
+                    return null;
+                }
+                // try resizing
+                if (len >= MAX_CVS) {
+                    throw new OutOfMemoryError(
+                        "Can't store " + liveCount.get() +
+                        " entries into a table of length " + len +
+                        " without clash"
+                    );
+                }
+                len <<= 1;
+                MutableCallSite[] newCvTable = new MutableCallSite[len];
+                // transfer entries
+                for (MutableCallSite e : cvTable) {
+                    if (e != null) {
+                        valueIdRef = getValueIdRef(e);
+                        if (valueIdRef.cvRef.get() != null) { // take only non-GC-ed CVs
+                            int i = valueIdRef.cvRef.hash & (newCvTable.length - 1);
+                            if (newCvTable[i] == null) {
+                                newCvTable[i] = e;
+                            } else {
+                                // clash in double-sized table when there was no clash
+                                // in smaller table should not be possible
+                                throw new AssertionError("Clash in resized table");
+                            }
+                        }
+                    }
+                }
+                // successfully transferred all entries -> re-probe availability with new table
+                type.cvTable = cvTable = newCvTable;
             }
         }
-        return cvTable == null || cvTable.length < index ? null : cvTable;
     }
 
     private static final Object CV_TABLE_LOCK_INIT_LOCK = new Object();
@@ -297,85 +359,67 @@ public abstract class ClassValue<T> {
      * <ul>
      *     <li>value - the value</li>
      *     <li>cvId - the ClassValue.id of the corresponding ClassValue</li>
+     *     <li>cvRef - a WeakReference of the corresponding ClassValue</li>
      * </ul>
      *
      * @param <T> type of value
      */
-    private static final class ValueId<T> {
-        // an instance with null value and zero cvId (not equal to any real instance)
-        private static final ValueId<?> NONE = new ValueId<>(null, 0L);
-        private static final MethodHandle NONE_MH = MethodHandles.constant(ValueId.class, NONE);
+    private static final class ValueIdRef<T> {
+        // an instance with zero cvId (not equal to any real instance)
+        private static final ValueIdRef<?> NONE = new ValueIdRef<>(null, 0L, Ref.HEAD);
+        private static final MethodHandle NONE_MH = MethodHandles.constant(ValueIdRef.class, NONE);
 
         @Stable
         private final T value;
         @Stable
         private final long cvId;
 
-        private ValueId(T value, long cvId) {
+        private final Ref cvRef;
+
+        private ValueIdRef(T value, long cvId, Ref cvRef) {
             this.value = value;
             this.cvId = cvId;
-        }
-    }
-
-    /**
-     * An entry holding a {@link MutableCallSite} and its {@code dynamicInvoker} which
-     * is used to retrieve current constant value but which may get redefined by setting new
-     * target.
-     */
-    static final class McsEntry {
-        @Stable
-        private final MutableCallSite mcs;
-        @Stable
-        private final MethodHandle dynamicInvoker;
-
-        private McsEntry(MethodHandle target) {
-            this.mcs = new MutableCallSite(target);
-            this.dynamicInvoker = mcs.dynamicInvoker();
-        }
-
-        private void setTarget(MethodHandle target) {
-            mcs.setTarget(target);
-            MutableCallSite.syncAll(new MutableCallSite[]{mcs});
+            this.cvRef = cvRef;
         }
     }
 
     /**
      * Tracks reachability of {@link ClassValue} being enqueued with CV's index when GCed.
      */
-    private static final class FreeIndex extends PhantomReference<ClassValue<?>> {
+    private static final class Ref extends WeakReference<ClassValue<?>> {
         private static final ReferenceQueue<ClassValue<?>> queue = new ReferenceQueue<>();
-        // special head instance that is never enqueued
-        private static final FreeIndex head = new FreeIndex(null);
+        // special head instance that is never enqueued and always refers to null referent
+        private static final Ref HEAD = new Ref(null);
 
-        private final int index;
-        private FreeIndex prev, next;
+        private final int hash;
+        private Ref prev, next;
 
-        private FreeIndex(ClassValue<?> referent) {
+        private Ref(ClassValue<?> referent) {
             super(referent, referent == null ? null : queue);
-            this.index = referent == null ? 0 : referent.index;
+            this.hash = referent == null ? 0 : referent.hash;
             if (referent == null) {
                 prev = next = this;
             } else {
-                synchronized (head) {
-                    prev = head;
-                    next = head.next;
-                    head.next.prev = this;
-                    head.next = this;
+                synchronized (HEAD) {
+                    prev = HEAD;
+                    next = HEAD.next;
+                    HEAD.next.prev = this;
+                    HEAD.next = this;
                 }
             }
         }
 
-        private static int poll() {
-            FreeIndex fi = (FreeIndex) queue.poll();
-            if (fi == null) {
+        private static int pollFreeHash() {
+            Ref ref = (Ref) queue.poll();
+            if (ref == null) {
                 return 0;
             } else {
-                synchronized (head) {
-                    fi.prev.next = fi.next;
-                    fi.next.prev = fi.prev;
-                    fi.next = fi.prev = fi;
+                synchronized (HEAD) {
+                    ref.prev.next = ref.next;
+                    ref.next.prev = ref.prev;
+                    ref.next = ref.prev = ref;
                 }
-                return fi.index;
+                return ref.hash;
             }
         }
     }

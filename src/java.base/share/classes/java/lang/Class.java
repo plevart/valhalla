@@ -27,6 +27,7 @@ package java.lang;
 
 import java.lang.annotation.Annotation;
 import java.lang.constant.ClassDesc;
+import java.lang.invoke.MutableCallSite;
 import java.lang.invoke.TypeDescriptor;
 import java.lang.invoke.MethodHandles;
 import java.lang.module.ModuleReader;
@@ -4239,7 +4240,7 @@ public final class Class<T> implements java.io.Serializable,
      * Maintained by the ClassValue class.
      */
     @Stable
-    transient ClassValue.McsEntry[] cvTable;
+    transient MutableCallSite[] cvTable;
 
     /* Per-class lock object used when accessing above cvTable in slow-path
      */
